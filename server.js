@@ -1,174 +1,127 @@
-// server.js
-const express = require("express");
-const fs = require("fs");
-const path = require("path");
-const cors = require("cors");
+import express from "express";
+import fs from "fs";
+import cors from "cors";
+import bodyParser from "body-parser";
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-const ADMIN_KEY = process.env.ADMIN_API_KEY || "changeme"; // imposta su Render
-
-const ORDERS_FILE = path.join(__dirname, "orders.json");
-const DISHES_FILE = path.join(__dirname, "dishes.json");
-
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
 
-/* ---------- Helpers per file JSON ---------- */
-const readJson = (filePath) => {
-  try {
-    if(!fs.existsSync(filePath)) fs.writeFileSync(filePath, JSON.stringify([]));
-    const raw = fs.readFileSync(filePath, "utf8");
-    return JSON.parse(raw || "[]");
-  } catch (err) {
-    console.error("readJson error:", err);
-    return [];
+const ORDERS_FILE = "./orders.json";
+const MENU_FILE = "./menu.json";
+const ADMIN_PIN = "123456"; // cambia questo con un tuo PIN segreto
+
+// --- Inizializza i file se non esistono ---
+if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, "[]");
+if (!fs.existsSync(MENU_FILE)) fs.writeFileSync(MENU_FILE, "[]");
+
+// --- Utility per leggere e scrivere JSON in modo sicuro ---
+const readJSON = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+const writeJSON = (file, data) =>
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+
+// ------------------- ORDINI -------------------
+
+// Invia nuovo ordine
+app.post("/api/order", (req, res) => {
+  const order = req.body;
+  if (!order || !order.phone || !order.items) {
+    return res.status(400).json({ error: "Dati ordine mancanti." });
   }
-};
 
-const writeJson = (filePath, data) => {
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error("writeJson error:", err);
-  }
-};
+  const orders = readJSON(ORDERS_FILE);
+  // controlla se l'utente ha già un ordine attivo
+  const existing = orders.find(
+    (o) => o.phone === order.phone && o.status !== "delivered"
+  );
+  if (existing)
+    return res
+      .status(403)
+      .json({ error: "Hai già un ordine attivo in corso." });
 
-/* ---------- Middleware admin check (header x-api-key) ---------- */
-const requireAdminKey = (req, res, next) => {
-  const key = req.header("x-api-key");
-  if (!key || key !== ADMIN_KEY) {
-    return res.status(401).json({ error: "Unauthorized (invalid API key)" });
-  }
-  next();
-};
-
-/* ============================
-   DISHES (menu) - persistent
-   Public: GET /dishes
-   Protected: POST /dishes, PATCH /dishes/:id, DELETE /dishes/:id
-   ============================ */
-
-/* GET dishes */
-app.get("/dishes", (req, res) => {
-  const dishes = readJson(DISHES_FILE);
-  res.json(dishes);
+  order.id = Date.now();
+  order.status = "in_preparazione";
+  orders.push(order);
+  writeJSON(ORDERS_FILE, orders);
+  res.json({ success: true });
 });
 
-/* POST add dish (protected) */
-app.post("/dishes", requireAdminKey, (req, res) => {
-  const { name, price, img, ingredients, tags, type } = req.body;
-  if (!name) return res.status(400).json({ error: "Missing name" });
-  const dishes = readJson(DISHES_FILE);
-  const newDish = {
-    id: Date.now(),
-    name,
-    price: Number(price || 0),
-    img: img || "",
-    ingredients: ingredients || "",
-    tags: Array.isArray(tags) ? tags : (tags ? [tags] : []),
-    type: type || ""
-  };
-  dishes.push(newDish);
-  writeJson(DISHES_FILE, dishes);
-  res.json({ success: true, dish: newDish });
-});
-
-/* PATCH update dish (protected) */
-app.patch("/dishes/:id", requireAdminKey, (req, res) => {
-  const id = parseInt(req.params.id);
-  let dishes = readJson(DISHES_FILE);
-  const idx = dishes.findIndex(d => d.id === id);
-  if (idx === -1) return res.status(404).json({ error: "Dish not found" });
-  const updated = { ...dishes[idx], ...req.body };
-  // sanitize tags if provided
-  if (req.body.tags && !Array.isArray(req.body.tags)) updated.tags = [req.body.tags];
-  dishes[idx] = updated;
-  writeJson(DISHES_FILE, dishes);
-  res.json({ success: true, dish: updated });
-});
-
-/* DELETE dish (protected) */
-app.delete("/dishes/:id", requireAdminKey, (req, res) => {
-  const id = parseInt(req.params.id);
-  let dishes = readJson(DISHES_FILE);
-  const idx = dishes.findIndex(d => d.id === id);
-  if (idx === -1) return res.status(404).json({ error: "Dish not found" });
-  const removed = dishes.splice(idx, 1)[0];
-  writeJson(DISHES_FILE, dishes);
-  res.json({ success: true, dish: removed });
-});
-
-/* ============================
-   ORDERS - persistent
-   Public: GET /orders
-   Protected: PATCH /orders/:id (update status), DELETE /orders/:id
-   POST /orders (public, creates new order, but server enforces single active per device)
-   ============================ */
-
-/* GET orders (public) */
-app.get("/orders", (req, res) => {
-  const orders = readJson(ORDERS_FILE);
+// Ottieni tutti gli ordini (solo admin)
+app.post("/api/admin/orders", (req, res) => {
+  const { pin } = req.body;
+  if (pin !== ADMIN_PIN) return res.status(403).json({ error: "Accesso negato" });
+  const orders = readJSON(ORDERS_FILE);
   res.json(orders);
 });
 
-/* POST new order (public) */
-app.post("/orders", (req, res) => {
-  const { cart, customerName, customerPhone, deviceId } = req.body;
-  if (!cart || !customerName || !customerPhone) {
-    return res.status(400).json({ error: "Missing order fields" });
+// Aggiorna stato ordine (solo admin)
+app.post("/api/admin/update", (req, res) => {
+  const { pin, id, status } = req.body;
+  if (pin !== ADMIN_PIN) return res.status(403).json({ error: "Accesso negato" });
+
+  const orders = readJSON(ORDERS_FILE);
+  const order = orders.find((o) => o.id === id);
+  if (!order) return res.status(404).json({ error: "Ordine non trovato" });
+
+  order.status = status;
+  writeJSON(ORDERS_FILE, orders);
+  res.json({ success: true });
+});
+
+// Elimina ordine (solo admin)
+app.post("/api/admin/delete", (req, res) => {
+  const { pin, id } = req.body;
+  if (pin !== ADMIN_PIN) return res.status(403).json({ error: "Accesso negato" });
+
+  let orders = readJSON(ORDERS_FILE);
+  orders = orders.filter((o) => o.id !== id);
+  writeJSON(ORDERS_FILE, orders);
+  res.json({ success: true });
+});
+
+// ------------------- MENU -------------------
+
+// Ottieni il menu
+app.get("/api/menu", (req, res) => {
+  const menu = readJSON(MENU_FILE);
+  res.json(menu);
+});
+
+// Aggiungi o modifica un piatto (solo admin)
+app.post("/api/admin/menu", (req, res) => {
+  const { pin, item } = req.body;
+  if (pin !== ADMIN_PIN) return res.status(403).json({ error: "Accesso negato" });
+
+  const menu = readJSON(MENU_FILE);
+  const existing = menu.find((m) => m.id === item.id);
+
+  if (existing) {
+    Object.assign(existing, item);
+  } else {
+    item.id = Date.now();
+    menu.push(item);
   }
 
-  const orders = readJson(ORDERS_FILE);
-
-  // Prevent duplicate active order by deviceId OR phone
-  const hasActive = orders.find(o => o.deviceId === deviceId || o.customerPhone === customerPhone);
-  if (hasActive) {
-    return res.status(409).json({ error: "Hai già un ordine attivo" });
-  }
-
-  const newOrder = {
-    id: Date.now(),
-    createdAt: new Date().toISOString(),
-    cart,
-    customerName,
-    customerPhone,
-    deviceId: deviceId || null,
-    status: "in preparazione"
-  };
-
-  orders.push(newOrder);
-  writeJson(ORDERS_FILE, orders);
-  res.json({ success: true, order: newOrder });
+  writeJSON(MENU_FILE, menu);
+  res.json({ success: true });
 });
 
-/* PATCH update order status (protected) */
-app.patch("/orders/:id", requireAdminKey, (req, res) => {
-  const id = parseInt(req.params.id);
-  const { status } = req.body;
-  if (!status) return res.status(400).json({ error: "Missing status" });
+// Elimina piatto (solo admin)
+app.post("/api/admin/menu/delete", (req, res) => {
+  const { pin, id } = req.body;
+  if (pin !== ADMIN_PIN) return res.status(403).json({ error: "Accesso negato" });
 
-  let orders = readJson(ORDERS_FILE);
-  const idx = orders.findIndex(o => o.id === id);
-  if (idx === -1) return res.status(404).json({ error: "Order not found" });
-
-  orders[idx].status = status;
-  writeJson(ORDERS_FILE, orders);
-  res.json({ success: true, order: orders[idx] });
+  let menu = readJSON(MENU_FILE);
+  menu = menu.filter((m) => m.id !== id);
+  writeJSON(MENU_FILE, menu);
+  res.json({ success: true });
 });
 
-/* DELETE order (protected) */
-app.delete("/orders/:id", requireAdminKey, (req, res) => {
-  const id = parseInt(req.params.id);
-  let orders = readJson(ORDERS_FILE);
-  const idx = orders.findIndex(o => o.id === id);
-  if (idx === -1) return res.status(404).json({ error: "Order not found" });
-  const removed = orders.splice(idx, 1)[0];
-  writeJson(ORDERS_FILE, orders);
-  res.json({ success: true, order: removed });
+// ------------------------------------------------
+
+app.get("/", (req, res) => {
+  res.send("✅ MikiTakeaway server attivo e sicuro!");
 });
 
-/* ---------- quick health check ---------- */
-app.get("/", (req, res) => res.send("MikiTakeaway server is running"));
-
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Server in ascolto su porta ${PORT}`));
